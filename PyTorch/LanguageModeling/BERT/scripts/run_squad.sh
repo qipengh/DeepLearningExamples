@@ -34,11 +34,11 @@ popd
 
 usage() {
     cmd="bash scripts/run_squad.sh checkpoint epochs batch_size learning_rate warmup_proportion precision"
-    cmd+=" num_gpu seed squad_dir vocab_file OUT_DIR mode CONFIG_FILE max_steps use_xla use_pjrt"
+    cmd+=" num_gpu seed squad_dir vocab_file OUT_DIR mode CONFIG_FILE max_steps use_xla use_pjrt use_xla_profiler"
     echo -e "\nCMD: $cmd \n"
 
     pre_cmd="bash scripts/run_squad.sh ./checkpoints/bert_large_qa.pt 2.0 4 3e-5 0.1 fp32 "
-    post_cmd+=" 1 \$SQUAD_DIR ./vocab/vocab output train-eval ./bert_configs/large.json -1 1 0"
+    post_cmd+=" 1 \$SQUAD_DIR ./vocab/vocab output train-eval ./bert_configs/large.json -1 1 1 0"
 
     echo "======= XLA with single card ======== "
     num_card=1
@@ -51,7 +51,7 @@ usage() {
     exit 1
 }
 
-if [ $# -lt 16 ] ; then
+if [ $# -lt 17 ] ; then
     usage
 fi
 
@@ -71,9 +71,11 @@ CONFIG_FILE=${13:-"/workspace/bert/bert_configs/large.json"}
 max_steps=${14:-"-1"}
 use_xla=${15:-"1"}
 use_pjrt=${16:-"0"}
+use_xla_profiler=${17:-"0"}
 
 export USE_XLA=$use_xla
 export USE_PJRT=$use_pjrt
+export USE_XLA_Profiler=$use_xla_profiler
 
 mpi_command=""
 if [ "$use_xla" = "1" ] ; then
@@ -83,6 +85,9 @@ if [ "$use_xla" = "1" ] ; then
   OUT_DIR+="_pjrt_$use_pjrt"
   if [ "$use_pjrt" = "1" ] ; then
     export PJRT_DEVICE=GPU
+  fi
+  if [ "$use_xla_profiler" = "1" ] ; then
+    OUT_DIR+="_profile_$use_xla_profiler"
   fi
 elif [ "$num_gpu" = "1" ] ; then
   export CUDA_VISIBLE_DEVICES=0
@@ -96,6 +101,7 @@ OUT_DIR+="_gpu_${num_gpu}_batch_${batch_size}"
 echo -e "\n==== ENV of XLA ===="
 echo "  USE_XLA(use xla to training): $use_xla"
 echo "  USE_PJRT(use xrt/pjrt backend): $use_pjrt"
+echo "  USE_XLA_Profiler(open xla profiler): $use_xla_profiler"
 echo "  GPU_NUM_DEVICES(number of XLA device with gpu): $num_gpu"
 echo "  TF_FORCE_GPU_ALLOW_GROWTH(Avoid XLA applying for all memory): true"
 

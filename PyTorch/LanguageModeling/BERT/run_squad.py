@@ -738,6 +738,59 @@ class GradientClipper:
         if clip_coef < 1:
             multi_tensor_applier(self.multi_tensor_scale, self._overflow_buf, [l, l], clip_coef)
 
+def train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epoch, scheduler):
+    input_ids, input_mask, segment_ids, start_positions, end_positions = batch
+    with xp.StepTrace('train_bert', step_num=step):
+        with xp.Trace('build_graph'):
+          start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+          # If we are on multi-GPU, split add a dimension
+          if len(start_positions.size()) > 1:
+              start_positions = start_positions.squeeze(-1)
+          if len(end_positions.size()) > 1:
+              end_positions = end_positions.squeeze(-1)
+          # sometimes the start/end positions are outside our model inputs, we ignore these terms
+          ignored_index = start_logits.size(1)
+          start_positions.clamp_(0, ignored_index)
+          end_positions.clamp_(0, ignored_index)
+
+          loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+          start_loss = loss_fct(start_logits, start_positions)
+          end_loss = loss_fct(end_logits, end_positions)
+          loss = (start_loss + end_loss) / 2
+          if n_gpu > 1:
+              loss = loss.mean()  # mean() to average on multi-gpu.
+          if args.gradient_accumulation_steps > 1:
+              loss = loss / args.gradient_accumulation_steps
+          if args.fp16:
+              with amp.scale_loss(loss, optimizer) as scaled_loss:
+                  scaled_loss.backward()
+          else:
+              loss.backward()
+
+        # gradient clipping
+        # gradClipper.step(amp.master_params(optimizer))
+
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            if args.fp16 :
+                # modify learning rate with special warm up for BERT which FusedAdam doesn't do
+                scheduler.step()
+            """ Support(XLA): optimizer of xla """
+            if USE_XLA:
+                xm.optimizer_step(optimizer)
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+
+        """ Support(XLA): mark for build/run graph """
+        if USE_XLA and (xm.xrt_world_size() == 1):
+            xm.mark_step()
+
+    final_loss = loss.item()
+    if step % args.log_freq == 0 and is_main_process():
+        dllogger.log(step=(epoch, global_step,), data={"step_loss": final_loss,
+                                                    "learning_rate": optimizer.param_groups[0]['lr']})
+
 """ Support(XLA): check xla """
 def is_xla_available():
     try:
@@ -894,6 +947,10 @@ def main():
             print("==== XLA Device: ", xm.xla_device())
             print("==== XLA Device List: ", xla_devices_list)
             print("==== XLA world size: ", xm.xrt_world_size())
+
+        if int(os.environ.get('USE_XLA_Profiler')):
+            profiler_port=9012
+            server = xp.start_server(profiler_port)
 
         ''' 2. 分布式, 选择xla 后端 '''
         if int(os.environ.get('USE_PJRT')):
@@ -1125,7 +1182,9 @@ def main():
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size * n_gpu)
 
         """ Support(XLA): add Distributed Dataloader """
-        if USE_XLA and (xm.xrt_world_size() > 1):
+        # if USE_XLA and (xm.xrt_world_size() > 1):
+        # when use MpDeviceLoader, performance will be better, even in a single card.
+        if USE_XLA:
             # train_dataloader = pl.ParallelLoader(train_dataloader, [device]).per_device_loader(device)
             train_dataloader = pl.MpDeviceLoader(train_dataloader, device)
 
@@ -1149,6 +1208,11 @@ def main():
 
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
+
+                if int(os.environ.get('USE_XLA_Profiler')):
+                    train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epoch, scheduler)
+                    continue
+
                 input_ids, input_mask, segment_ids, start_positions, end_positions = batch
                 start_logits, end_logits = model(input_ids, segment_ids, input_mask)
                 # If we are on multi-GPU, split add a dimension
@@ -1247,7 +1311,9 @@ def main():
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.predict_batch_size)
 
         """ Support(XLA): add Distributed Dataloader """
-        if USE_XLA and (xm.xrt_world_size() > 1):
+        # if USE_XLA and (xm.xrt_world_size() > 1):
+        # when use MpDeviceLoader, performance will be better, even in a single card.
+        if USE_XLA:
             eval_dataloader = pl.MpDeviceLoader(eval_dataloader, device)
 
         infer_start = time.time()
