@@ -742,30 +742,33 @@ def train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epo
     input_ids, input_mask, segment_ids, start_positions, end_positions = batch
     with xp.StepTrace('train_bert', step_num=step):
         with xp.Trace('build_graph'):
-          start_logits, end_logits = model(input_ids, segment_ids, input_mask)
-          # If we are on multi-GPU, split add a dimension
-          if len(start_positions.size()) > 1:
-              start_positions = start_positions.squeeze(-1)
-          if len(end_positions.size()) > 1:
-              end_positions = end_positions.squeeze(-1)
-          # sometimes the start/end positions are outside our model inputs, we ignore these terms
-          ignored_index = start_logits.size(1)
-          start_positions.clamp_(0, ignored_index)
-          end_positions.clamp_(0, ignored_index)
+            print("Tracing ...")
 
-          loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
-          start_loss = loss_fct(start_logits, start_positions)
-          end_loss = loss_fct(end_logits, end_positions)
-          loss = (start_loss + end_loss) / 2
-          if n_gpu > 1:
-              loss = loss.mean()  # mean() to average on multi-gpu.
-          if args.gradient_accumulation_steps > 1:
-              loss = loss / args.gradient_accumulation_steps
-          if args.fp16:
-              with amp.scale_loss(loss, optimizer) as scaled_loss:
-                  scaled_loss.backward()
-          else:
-              loss.backward()
+            import sys;sys.stdout.flush()
+            start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            loss = (start_loss + end_loss) / 2
+            if n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu.
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+            if args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
 
         # gradient clipping
         # gradClipper.step(amp.master_params(optimizer))
@@ -801,7 +804,7 @@ def is_xla_available():
         print("XLA is unavailable!!! \n set GPU_NUM_DEVICES env ?")
         return False
 
-def main():
+def main(port=9012):
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -949,8 +952,10 @@ def main():
             print("==== XLA world size: ", xm.xrt_world_size())
 
         if int(os.environ.get('USE_XLA_Profiler')):
-            profiler_port=9012
-            server = xp.start_server(profiler_port)
+            #profiler_port=9012
+            print("start server ...")
+            #global port
+            server = xp.start_server(port)
 
         ''' 2. 分布式, 选择xla 后端 '''
         if int(os.environ.get('USE_PJRT')):
@@ -1208,8 +1213,13 @@ def main():
 
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
-
+ 
+                print("xla profiler: ")
+                import sys;sys.stdout.flush()
                 if int(os.environ.get('USE_XLA_Profiler')):
+                    print("xla profiler: 11 ")
+                    import sys;sys.stdout.flush()
+                    scheduler = scheduler if args.do_train and args.fp16 else None
                     train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epoch, scheduler)
                     continue
 
@@ -1400,9 +1410,67 @@ def _mp_fn(index):
     # within the target function of xmp.spawn() (or any function which has xmp.spawn() as parent in the call stack).
     main()
 
+def run_xla_profiler():
+    import glob
+    import multiprocessing
+    import tempfile
+    import unittest
+    import logging
+    logging.getLogger().setLevel(logging.INFO)
+
+    fd, fname = tempfile.mkstemp('.metrics')
+    os.environ['PT_XLA_DEBUG'] = '1'
+    os.environ['PT_XLA_DEBUG_FILE'] = fname
+
+    port = xu.get_free_tcp_ports()[0]
+    training_started = multiprocessing.Event()
+
+    p = multiprocessing.Process(target=main, args=(port,), daemon=True)
+    p.start()
+    training_started.wait(60)
+
+    logdir = tempfile.mkdtemp()
+    #xp.trace(
+    #    f'localhost:{port}',
+    #    logdir,
+    #    duration_ms=5000,
+    #    num_tracing_attempts=5,
+    #    delay_ms=1000)
+    xp.trace(
+        f'localhost:{port}',
+        logdir,
+        duration_ms=600000,
+        num_tracing_attempts=5,
+        delay_ms=1000)
+    p.terminate()
+
+    path = os.path.join(logdir, 'plugins', 'profile', '*', '*.xplane.pb')
+    paths = glob.glob(path)
+    print("Expected one path match: {}, len: ", path, len(paths))
+    path = paths[0]
+    with open(path, 'rb') as f:
+      proto_str = str(f.read())
+    unittest.TestCase.assertTrue('train_mnist' in proto_str,
+                    f'Expected "train_mnist" trace in: {path}')
+    unittest.TestCase.assertTrue('build_graph' in proto_str,
+                    f'Expected "build_graph" trace in: {path}')
+    with open(fname, 'r') as f:
+      debug_warnings = f.read()
+    logging.info(f'PT_XLA_DEBUG_FILE Contents:\n{debug_warnings}')
+    unittest.TestCase.assertTrue('TransferFromServerTime too frequent' in debug_warnings,
+                    f'Expected "TransferFromServerTime" warning in: {fname}')
+    unittest.TestCase.assertTrue('CompileTime too frequent' in debug_warnings,
+                    f'Expected "CompileTime" wraning in: {fname}')
+
+    os.close(fd)
+    os.remove(fname)
+
+
 if __name__ == "__main__":
     """ Support(XLA): run multi-processing must be called by xmp.spawn()  """
-    if int(os.environ.get('USE_XLA')):
+    if int(os.environ.get('USE_XLA_Profiler')):
+        run_xla_profiler()
+    elif int(os.environ.get('USE_XLA')):
         xmp.spawn(_mp_fn, args=())
     else:
         main()
