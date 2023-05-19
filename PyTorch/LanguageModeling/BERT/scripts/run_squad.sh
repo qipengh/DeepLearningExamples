@@ -116,6 +116,9 @@ use_fp16=""
 if [ "$precision" = "fp16" ] ; then
   echo "fp16 activated!"
   use_fp16=" --fp16 "
+elif [ "$precision" = "pyamp" ] ; then
+  echo "pyamp activated!"
+  use_fp16=" --pyamp "
 fi
 
 CMD="python  $mpi_command run_squad.py "

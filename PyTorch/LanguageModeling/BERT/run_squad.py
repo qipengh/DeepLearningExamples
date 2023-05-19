@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
@@ -935,6 +936,8 @@ def main(port=9012):
                         default=False,
                         action='store_true',
                         help="Whether to profile model.")
+    parser.add_argument('--pyamp', action='store_true', default=False,
+                    help='use pytorch amp for mixed precision training')
 
     args = parser.parse_args()
     args.fp16 = args.fp16 or args.amp
@@ -1012,6 +1015,10 @@ def main(port=9012):
     if is_main_process():
         dllogger.log(step="PARAMETER", data={"SEED": args.seed})
 
+    scaler = None
+    if args.pyamp:
+        scaler = GradScaler()
+
     if n_gpu > 0:
         """ Support(XLA): set rand seed """
         if USE_XLA:
@@ -1066,6 +1073,9 @@ def main(port=9012):
     checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
     checkpoint = checkpoint["model"] if "model" in checkpoint.keys() else checkpoint
     model.load_state_dict(checkpoint, strict=False)
+    if args.pyamp:
+        if isinstance(checkpoint, dict) and 'amp' in checkpoint:
+            scaler.load_state_dict(checkpoint['amp'])
     if is_main_process():
         dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
     model.to(device)
@@ -1213,7 +1223,7 @@ def main(port=9012):
 
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
- 
+
                 print("xla profiler: ")
                 import sys;sys.stdout.flush()
                 if int(os.environ.get('USE_XLA_Profiler')):
@@ -1224,21 +1234,23 @@ def main(port=9012):
                     continue
 
                 input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                start_logits, end_logits = model(input_ids, segment_ids, input_mask)
-                # If we are on multi-GPU, split add a dimension
-                if len(start_positions.size()) > 1:
-                    start_positions = start_positions.squeeze(-1)
-                if len(end_positions.size()) > 1:
-                    end_positions = end_positions.squeeze(-1)
-                # sometimes the start/end positions are outside our model inputs, we ignore these terms
-                ignored_index = start_logits.size(1)
-                start_positions.clamp_(0, ignored_index)
-                end_positions.clamp_(0, ignored_index)
+                with autocast(enabled=args.pyamp):
+                    print("autocast: ", args.pyamp)
+                    start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+                    # If we are on multi-GPU, split add a dimension
+                    if len(start_positions.size()) > 1:
+                        start_positions = start_positions.squeeze(-1)
+                    if len(end_positions.size()) > 1:
+                        end_positions = end_positions.squeeze(-1)
+                    # sometimes the start/end positions are outside our model inputs, we ignore these terms
+                    ignored_index = start_logits.size(1)
+                    start_positions.clamp_(0, ignored_index)
+                    end_positions.clamp_(0, ignored_index)
 
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
-                start_loss = loss_fct(start_logits, start_positions)
-                end_loss = loss_fct(end_logits, end_positions)
-                loss = (start_loss + end_loss) / 2
+                    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+                    start_loss = loss_fct(start_logits, start_positions)
+                    end_loss = loss_fct(end_logits, end_positions)
+                    loss = (start_loss + end_loss) / 2
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -1246,6 +1258,8 @@ def main(port=9012):
                 if args.fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
+                elif args.pyamp:
+                    scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
@@ -1259,7 +1273,11 @@ def main(port=9012):
                     """ Support(XLA): optimizer of xla """
                     if USE_XLA:
                         xm.optimizer_step(optimizer)
-                    else:
+
+                    if args.pyamp:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    if not(USE_XLA or args.pyamp):
                         optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -1285,6 +1303,8 @@ def main(port=9012):
             print("XLA skip save model...")
         else:
             torch.save({"model":model_to_save.state_dict()}, output_model_file)
+        #if args.pyamp and scaler is not None:
+        #    save_params["amp"]=scaler.state_dict()
         output_config_file = os.path.join(args.output_dir, modeling.CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
