@@ -30,12 +30,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
-from apex import amp
+# from apex import amp
 from schedulers import LinearWarmUpScheduler
 from file_utils import PYTORCH_PRETRAINED_BERT_CACHE
 import modeling
@@ -43,6 +44,21 @@ from optimization import BertAdam, warmup_linear
 from tokenization import (BasicTokenizer, BertTokenizer, whitespace_tokenize)
 from utils import is_main_process, format_step
 import dllogger, time
+
+""" Support(XLA): import xla """
+if int(os.environ.get('USE_XLA')):
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    # xla dist
+    import torch_xla.debug.metrics as met
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.debug.profiler as xp
+    import torch_xla.utils.utils as xu
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.test.test_utils as test_utils
+    import torch_xla.distributed.xla_backend
+    # xla amp
+    import torch_xla.amp
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -458,7 +474,7 @@ def get_answers(examples, features, results, args):
             curr_predictions.append(Prediction(final_text, pred.start_logit, pred.end_logit))
         predictions[ex.qas_id] += curr_predictions
 
-    #Add empty prediction
+    #add empty prediction
     if args.version_2_with_negative:
         for qas_id in predictions.keys():
             predictions[qas_id].append(Prediction('',
@@ -699,7 +715,7 @@ def _compute_softmax(scores):
 
 
 
-from apex.multi_tensor_apply import multi_tensor_applier
+# from apex.multi_tensor_apply import multi_tensor_applier
 class GradientClipper:
     """
     Clips gradient norm of an iterable of parameters.
@@ -723,8 +739,73 @@ class GradientClipper:
         if clip_coef < 1:
             multi_tensor_applier(self.multi_tensor_scale, self._overflow_buf, [l, l], clip_coef)
 
+def train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epoch, scheduler):
+    input_ids, input_mask, segment_ids, start_positions, end_positions = batch
+    with xp.StepTrace('train_bert', step_num=step):
+        with xp.Trace('build_graph'):
+            print("Tracing ...")
 
-def main():
+            import sys;sys.stdout.flush()
+            start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            loss = (start_loss + end_loss) / 2
+            if n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu.
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+            if args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+        # gradient clipping
+        # gradClipper.step(amp.master_params(optimizer))
+
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            if args.fp16 :
+                # modify learning rate with special warm up for BERT which FusedAdam doesn't do
+                scheduler.step()
+            """ Support(XLA): optimizer of xla """
+            if USE_XLA:
+                xm.optimizer_step(optimizer)
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+
+        """ Support(XLA): mark for build/run graph """
+        if USE_XLA and (xm.xrt_world_size() == 1):
+            xm.mark_step()
+
+    final_loss = loss.item()
+    if step % args.log_freq == 0 and is_main_process():
+        dllogger.log(step=(epoch, global_step,), data={"step_loss": final_loss,
+                                                    "learning_rate": optimizer.param_groups[0]['lr']})
+
+""" Support(XLA): check xla """
+def is_xla_available():
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        return xm.xla_device().type == 'xla'
+    except Exception:
+        print("XLA is unavailable!!! \n set GPU_NUM_DEVICES env ?")
+        return False
+
+def main(port=9012):
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -787,7 +868,8 @@ def main():
     parser.add_argument("--do_lower_case",
                         action='store_true',
                         help="Whether to lower case the input text. True for uncased models, False for cased models.")
-    parser.add_argument("--local_rank",
+    parser.add_argument("--local-rank",
+                        "--local_rank",
                         type=int,
                         default=os.getenv('LOCAL_RANK', -1),
                         help="local_rank for distributed training on gpus")
@@ -854,11 +936,40 @@ def main():
                         default=False,
                         action='store_true',
                         help="Whether to profile model.")
+    parser.add_argument('--pyamp', action='store_true', default=False,
+                    help='use pytorch amp for mixed precision training')
 
     args = parser.parse_args()
     args.fp16 = args.fp16 or args.amp
 
-    if args.local_rank == -1 or args.no_cuda:
+    """ Support(XLA): set xla device and dist """
+    USE_XLA = (int(os.environ.get('USE_XLA')) and is_xla_available())
+    if USE_XLA:
+        print(">>> xla_device_idx: ", xm.get_ordinal())
+        import sys;sys.stdout.flush()
+
+        xla_devices_list = xm.get_xla_supported_devices()
+        if (xm.xrt_world_size() == 1) or is_main_process():
+            print("==== XLA Device: ", xm.xla_device())
+            print("==== XLA Device List: ", xla_devices_list)
+            print("==== XLA world size: ", xm.xrt_world_size())
+
+        if int(os.environ.get('USE_XLA_Profiler')):
+            #profiler_port=9012
+            print("start server ...")
+            #global port
+            server = xp.start_server(port)
+
+        ''' 2. 分布式, 选择xla 后端 '''
+        if int(os.environ.get('USE_PJRT')):
+          import torch_xla.experimental.pjrt_backend
+          torch.distributed.init_process_group('xla', init_method='pjrt://')
+        elif len(xla_devices_list) > 1:
+          torch.distributed.init_process_group(
+              'xla', world_size=xm.xrt_world_size(), rank=xm.get_ordinal())
+        device = xm.xla_device()
+        n_gpu = 1
+    elif args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         n_gpu = torch.cuda.device_count()
     else:
@@ -872,10 +983,10 @@ def main():
         Path(os.path.dirname(args.json_summary)).mkdir(parents=True, exist_ok=True)
         dllogger.init(backends=[dllogger.JSONStreamBackend(verbosity=dllogger.Verbosity.VERBOSE,
                                                            filename=args.json_summary),
-                                dllogger.StdOutBackend(verbosity=dllogger.Verbosity.VERBOSE, step_format=format_step)])
+                                dllogger.StdOutBackend(verbosity=dllogger.Verbosity.DEFAULT, step_format=format_step)])
     else:
         dllogger.init(backends=[])
-    
+
     dllogger.metadata("e2e_train_time", {"unit": "s"})
     dllogger.metadata("training_sequences_per_second", {"unit": "sequences/s"})
     dllogger.metadata("final_loss", {"unit": None})
@@ -884,10 +995,13 @@ def main():
     dllogger.metadata("exact_match", {"unit": None})
     dllogger.metadata("F1", {"unit": None})
 
+    """ Support(XLA): check dist by world_size """
+    is_distributed = bool(xm.xrt_world_size() > 1) if USE_XLA else bool(args.local_rank != -1)
     print("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-                                device, n_gpu, bool(args.local_rank != -1), args.fp16))
+                                device, n_gpu, is_distributed, args.fp16))
 
-    dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
+    if is_main_process():
+        dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -898,10 +1012,19 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    dllogger.log(step="PARAMETER", data={"SEED": args.seed})
+    if is_main_process():
+        dllogger.log(step="PARAMETER", data={"SEED": args.seed})
+
+    scaler = None
+    if args.pyamp:
+        scaler = GradScaler()
 
     if n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
+        """ Support(XLA): set rand seed """
+        if USE_XLA:
+            xm.set_rng_state(args.seed, device=xm.xla_device())
+        else:
+            torch.cuda.manual_seed_all(args.seed)
 
     if not args.do_train and not args.do_predict:
         raise ValueError("At least one of `do_train` or `do_predict` must be True.")
@@ -930,7 +1053,10 @@ def main():
             input_file=args.train_file, is_training=True, version_2_with_negative=args.version_2_with_negative)
         num_train_optimization_steps = int(
             len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs
-        if args.local_rank != -1:
+        """ Support(XLA): set train_steps of dist """
+        if USE_XLA and (xm.xrt_world_size() > 1):
+            num_train_optimization_steps = num_train_optimization_steps // xm.xrt_world_size()
+        elif args.local_rank != -1:
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
@@ -942,14 +1068,20 @@ def main():
     model = modeling.BertForQuestionAnswering(config)
     # model = modeling.BertForQuestionAnswering.from_pretrained(args.bert_model,
                 # cache_dir=os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank)))
-    dllogger.log(step="PARAMETER", data={"loading_checkpoint": True})
+    if is_main_process():
+        dllogger.log(step="PARAMETER", data={"loading_checkpoint": True})
     checkpoint = torch.load(args.init_checkpoint, map_location='cpu')
     checkpoint = checkpoint["model"] if "model" in checkpoint.keys() else checkpoint
     model.load_state_dict(checkpoint, strict=False)
-    dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
+    if args.pyamp:
+        if isinstance(checkpoint, dict) and 'amp' in checkpoint:
+            scaler.load_state_dict(checkpoint['amp'])
+    if is_main_process():
+        dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
     model.to(device)
     num_weights = sum([p.numel() for p in model.parameters() if p.requires_grad])
-    dllogger.log(step="PARAMETER", data={"model_weights_num":num_weights})
+    if is_main_process():
+        dllogger.log(step="PARAMETER", data={"model_weights_num":num_weights})
 
     # Prepare optimizer
     param_optimizer = list(model.named_parameters())
@@ -988,7 +1120,15 @@ def main():
                                     warmup=args.warmup_proportion,
                                     t_total=num_train_optimization_steps)
 
-    if args.local_rank != -1:
+    if USE_XLA:
+        """ Support(XLA): wrap model when pjrt """
+        # Initialization is nondeterministic with multiple threads in PjRt.
+        # Synchronize model parameters across replicas manually.
+        import torch_xla
+        from torch_xla.experimental import pjrt
+        if pjrt.using_pjrt():
+            pjrt.broadcast_master_param(model)
+    elif args.local_rank != -1:
         try:
             from apex.parallel import DistributedDataParallel as DDP
         except ImportError:
@@ -1029,11 +1169,12 @@ def main():
                 with open(cached_train_features_file, "wb") as writer:
                     pickle.dump(train_features, writer)
 
-        dllogger.log(step="PARAMETER", data={"train_start": True})
-        dllogger.log(step="PARAMETER", data={"training_samples": len(train_examples)})
-        dllogger.log(step="PARAMETER", data={"training_features": len(train_features)})
-        dllogger.log(step="PARAMETER", data={"train_batch_size":args.train_batch_size})
-        dllogger.log(step="PARAMETER", data={"steps":num_train_optimization_steps})
+        if is_main_process():
+            dllogger.log(step="PARAMETER", data={"train_start": True})
+            dllogger.log(step="PARAMETER", data={"training_samples": len(train_examples)})
+            dllogger.log(step="PARAMETER", data={"training_features": len(train_features)})
+            dllogger.log(step="PARAMETER", data={"train_batch_size":args.train_batch_size})
+            dllogger.log(step="PARAMETER", data={"steps":num_train_optimization_steps})
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
@@ -1041,19 +1182,39 @@ def main():
         all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
                                    all_start_positions, all_end_positions)
-        if args.local_rank == -1:
+        """ Support(XLA): add Distributed Sampler """
+        if USE_XLA and (xm.xrt_world_size() > 1):
+            train_sampler=torch.utils.data.distributed.DistributedSampler(
+                train_data,
+                num_replicas=xm.xrt_world_size(),
+                rank=xm.get_ordinal(),
+                shuffle=True
+            )
+        elif args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
             train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size * n_gpu)
 
+        """ Support(XLA): add Distributed Dataloader """
+        # if USE_XLA and (xm.xrt_world_size() > 1):
+        # when use MpDeviceLoader, performance will be better, even in a single card.
+        if USE_XLA:
+            # train_dataloader = pl.ParallelLoader(train_dataloader, [device]).per_device_loader(device)
+            train_dataloader = pl.MpDeviceLoader(train_dataloader, device)
+
         model.train()
-        gradClipper = GradientClipper(max_grad_norm=1.0)
+        # gradClipper = GradientClipper(max_grad_norm=1.0)
         final_loss = None
 
         train_start = time.time()
         for epoch in range(int(args.num_train_epochs)):
-            train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+            # add e2e time of one iter (s/it)
+            bar_format = '{l_bar}{bar}|{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}, {rate_inv_fmt}]'
+            if is_main_process():
+                train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar, bar_format=bar_format)
+            else:
+                train_iter = train_dataloader
             for step, batch in enumerate(train_iter):
                 # Terminate early for benchmarking
 
@@ -1062,22 +1223,34 @@ def main():
 
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
-                input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                start_logits, end_logits = model(input_ids, segment_ids, input_mask)
-                # If we are on multi-GPU, split add a dimension
-                if len(start_positions.size()) > 1:
-                    start_positions = start_positions.squeeze(-1)
-                if len(end_positions.size()) > 1:
-                    end_positions = end_positions.squeeze(-1)
-                # sometimes the start/end positions are outside our model inputs, we ignore these terms
-                ignored_index = start_logits.size(1)
-                start_positions.clamp_(0, ignored_index)
-                end_positions.clamp_(0, ignored_index)
 
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
-                start_loss = loss_fct(start_logits, start_positions)
-                end_loss = loss_fct(end_logits, end_positions)
-                loss = (start_loss + end_loss) / 2
+                print("xla profiler: ")
+                import sys;sys.stdout.flush()
+                if int(os.environ.get('USE_XLA_Profiler')):
+                    print("xla profiler: 11 ")
+                    import sys;sys.stdout.flush()
+                    scheduler = scheduler if args.do_train and args.fp16 else None
+                    train_iter_profiler(args, batch, step, model, optimizer, n_gpu, USE_XLA, epoch, scheduler)
+                    continue
+
+                input_ids, input_mask, segment_ids, start_positions, end_positions = batch
+                with autocast(enabled=args.pyamp):
+                    print("autocast: ", args.pyamp)
+                    start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+                    # If we are on multi-GPU, split add a dimension
+                    if len(start_positions.size()) > 1:
+                        start_positions = start_positions.squeeze(-1)
+                    if len(end_positions.size()) > 1:
+                        end_positions = end_positions.squeeze(-1)
+                    # sometimes the start/end positions are outside our model inputs, we ignore these terms
+                    ignored_index = start_logits.size(1)
+                    start_positions.clamp_(0, ignored_index)
+                    end_positions.clamp_(0, ignored_index)
+
+                    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
+                    start_loss = loss_fct(start_logits, start_positions)
+                    end_loss = loss_fct(end_logits, end_positions)
+                    loss = (start_loss + end_loss) / 2
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -1085,22 +1258,36 @@ def main():
                 if args.fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
+                elif args.pyamp:
+                    scaler.scale(loss).backward()
                 else:
                     loss.backward()
 
                 # gradient clipping
-                gradClipper.step(amp.master_params(optimizer))
+                # gradClipper.step(amp.master_params(optimizer))
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if args.fp16 :
                         # modify learning rate with special warm up for BERT which FusedAdam doesn't do
                         scheduler.step()
-                    optimizer.step()
+                    """ Support(XLA): optimizer of xla """
+                    if USE_XLA:
+                        xm.optimizer_step(optimizer)
+
+                    if args.pyamp:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    if not(USE_XLA or args.pyamp):
+                        optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
 
+                """ Support(XLA): mark for build/run graph """
+                if USE_XLA and (xm.xrt_world_size() == 1):
+                    xm.mark_step()
+
                 final_loss = loss.item()
-                if step % args.log_freq == 0:
+                if step % args.log_freq == 0 and is_main_process():
                     dllogger.log(step=(epoch, global_step,), data={"step_loss": final_loss,
                                                                 "learning_rate": optimizer.param_groups[0]['lr']})
         time_to_train = time.time() - train_start
@@ -1109,12 +1296,21 @@ def main():
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
         output_model_file = os.path.join(args.output_dir, modeling.WEIGHTS_NAME)
-        torch.save({"model":model_to_save.state_dict()}, output_model_file)
+        """ Support(XLA): save model """
+        if USE_XLA:
+            # TODO(XLA): xm.save(model) will be blocking when multi-perocessing.
+            # xm.save({"model":model_to_save.state_dict()}, output_model_file)
+            print("XLA skip save model...")
+        else:
+            torch.save({"model":model_to_save.state_dict()}, output_model_file)
+        #if args.pyamp and scaler is not None:
+        #    save_params["amp"]=scaler.state_dict()
         output_config_file = os.path.join(args.output_dir, modeling.CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
 
-    if args.do_predict and (args.local_rank == -1 or is_main_process()):
+    is_single_device = (xm.xrt_world_size() == 1) if USE_XLA else (args.local_rank == -1)
+    if args.do_predict and (is_single_device or is_main_process()):
 
         if not args.do_train and args.fp16:
             model.half()
@@ -1129,10 +1325,11 @@ def main():
             max_query_length=args.max_query_length,
             is_training=False)
 
-        dllogger.log(step="PARAMETER", data={"infer_start": True})
-        dllogger.log(step="PARAMETER", data={"eval_samples": len(eval_examples)})
-        dllogger.log(step="PARAMETER", data={"eval_features": len(eval_features)})
-        dllogger.log(step="PARAMETER", data={"predict_batch_size": args.predict_batch_size})
+        if is_main_process():
+            dllogger.log(step="PARAMETER", data={"infer_start": True})
+            dllogger.log(step="PARAMETER", data={"eval_samples": len(eval_examples)})
+            dllogger.log(step="PARAMETER", data={"eval_features": len(eval_features)})
+            dllogger.log(step="PARAMETER", data={"predict_batch_size": args.predict_batch_size})
 
         all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
@@ -1143,18 +1340,28 @@ def main():
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.predict_batch_size)
 
+        """ Support(XLA): add Distributed Dataloader """
+        # if USE_XLA and (xm.xrt_world_size() > 1):
+        # when use MpDeviceLoader, performance will be better, even in a single card.
+        if USE_XLA:
+            eval_dataloader = pl.MpDeviceLoader(eval_dataloader, device)
+
         infer_start = time.time()
         model.eval()
         all_results = []
-        dllogger.log(step="PARAMETER", data={"eval_start": True})
+        if is_main_process():
+            dllogger.log(step="PARAMETER", data={"eval_start": True})
         for input_ids, input_mask, segment_ids, example_indices in tqdm(eval_dataloader, desc="Evaluating", disable=args.disable_progress_bar):
-            if len(all_results) % 1000 == 0:
+            if len(all_results) % 1000 == 0 and is_main_process():
                 dllogger.log(step="PARAMETER", data={"sample_number": len(all_results)})
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
             with torch.no_grad():
                 batch_start_logits, batch_end_logits = model(input_ids, segment_ids, input_mask)
+                """ Support(XLA): mark for build/run graph """
+                if USE_XLA and (xm.xrt_world_size() == 1):
+                    xm.mark_step()
             for i, example_index in enumerate(example_indices):
                 start_logits = batch_start_logits[i].detach().cpu().tolist()
                 end_logits = batch_end_logits[i].detach().cpu().tolist()
@@ -1195,21 +1402,95 @@ def main():
         if torch.distributed.is_initialized():
             gpu_count = torch.distributed.get_world_size()
 
-        if args.max_steps == -1:
+        if is_main_process():
+            if args.max_steps == -1:
+                train_seqs_per_second = len(train_features) * args.num_train_epochs / time_to_train
+            else:
+                train_seqs_per_second = args.train_batch_size * args.gradient_accumulation_steps \
+                                                  * args.max_steps * gpu_count / time_to_train
             dllogger.log(step=tuple(), data={"e2e_train_time": time_to_train,
-                                             "training_sequences_per_second": len(train_features) * args.num_train_epochs / time_to_train,
-                                             "final_loss": final_loss})
-        else:
-            dllogger.log(step=tuple(), data={"e2e_train_time": time_to_train,
-                                             "training_sequences_per_second": args.train_batch_size * args.gradient_accumulation_steps \
-                                              * args.max_steps * gpu_count / time_to_train,
-                                              "final_loss": final_loss})
+                                            "training_sequences_per_second": train_seqs_per_second,
+                                            "final_loss": final_loss})
+
     if args.do_predict and is_main_process():
         dllogger.log(step=tuple(), data={"e2e_inference_time": time_to_infer,
                                                  "inference_sequences_per_second": len(eval_features) / time_to_infer})
     if args.do_eval and is_main_process():
         dllogger.log(step=tuple(), data={"exact_match": exact_match, "F1": f1})
 
-if __name__ == "__main__":
-    main()
     dllogger.flush()
+
+def _mp_fn(index):
+    # xmp.spawn(): creates the processes that each run an XLA device.
+    # MpDeviceLoader: loads the training data onto each device.
+    # xm.optimizer_step(optimizer): consolidates the gradients between cores and issues the XLA device step computation.
+    # The model definition, optimizer definition and training loop remain the same.
+
+    # NOTE: when using multi-processing, the user can start retrieving and accessing XLA devices only from
+    # within the target function of xmp.spawn() (or any function which has xmp.spawn() as parent in the call stack).
+    main()
+
+def run_xla_profiler():
+    import glob
+    import multiprocessing
+    import tempfile
+    import unittest
+    import logging
+    logging.getLogger().setLevel(logging.INFO)
+
+    fd, fname = tempfile.mkstemp('.metrics')
+    os.environ['PT_XLA_DEBUG'] = '1'
+    os.environ['PT_XLA_DEBUG_FILE'] = fname
+
+    port = xu.get_free_tcp_ports()[0]
+    training_started = multiprocessing.Event()
+
+    p = multiprocessing.Process(target=main, args=(port,), daemon=True)
+    p.start()
+    training_started.wait(60)
+
+    logdir = tempfile.mkdtemp()
+    #xp.trace(
+    #    f'localhost:{port}',
+    #    logdir,
+    #    duration_ms=5000,
+    #    num_tracing_attempts=5,
+    #    delay_ms=1000)
+    xp.trace(
+        f'localhost:{port}',
+        logdir,
+        duration_ms=600000,
+        num_tracing_attempts=5,
+        delay_ms=1000)
+    p.terminate()
+
+    path = os.path.join(logdir, 'plugins', 'profile', '*', '*.xplane.pb')
+    paths = glob.glob(path)
+    print("Expected one path match: {}, len: ", path, len(paths))
+    path = paths[0]
+    with open(path, 'rb') as f:
+      proto_str = str(f.read())
+    unittest.TestCase.assertTrue('train_mnist' in proto_str,
+                    f'Expected "train_mnist" trace in: {path}')
+    unittest.TestCase.assertTrue('build_graph' in proto_str,
+                    f'Expected "build_graph" trace in: {path}')
+    with open(fname, 'r') as f:
+      debug_warnings = f.read()
+    logging.info(f'PT_XLA_DEBUG_FILE Contents:\n{debug_warnings}')
+    unittest.TestCase.assertTrue('TransferFromServerTime too frequent' in debug_warnings,
+                    f'Expected "TransferFromServerTime" warning in: {fname}')
+    unittest.TestCase.assertTrue('CompileTime too frequent' in debug_warnings,
+                    f'Expected "CompileTime" wraning in: {fname}')
+
+    os.close(fd)
+    os.remove(fname)
+
+
+if __name__ == "__main__":
+    """ Support(XLA): run multi-processing must be called by xmp.spawn()  """
+    if int(os.environ.get('USE_XLA_Profiler')):
+        run_xla_profiler()
+    elif int(os.environ.get('USE_XLA')):
+        xmp.spawn(_mp_fn, args=())
+    else:
+        main()

@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 from pathlib import Path
-
+import os
 
 def get_rank():
     if not dist.is_available():
@@ -26,6 +26,12 @@ def get_rank():
 
 
 def get_world_size():
+    """ Support(XLA): get world_size of xla """
+    if int(os.environ.get('USE_XLA')):
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        return xm.xrt_world_size()
+
     if not dist.is_available():
         return 1
     if not dist.is_initialized():
@@ -34,6 +40,11 @@ def get_world_size():
 
 
 def is_main_process():
+    """ Support(XLA): get rank of xla """
+    if int(os.environ.get('USE_XLA')):
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        return xm.is_master_ordinal()
     return get_rank() == 0
 
 
